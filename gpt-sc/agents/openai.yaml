@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT-SC"
+  short_description: "首次初始化 Windows GPT 快捷键，后续按需自定义快捷键，完成后提示手动重启"
+  default_prompt: "使用 $gpt-sc 初始化或修改我指定的 GPT 快捷键，设置完成后提醒我手动重启 GPT。"
