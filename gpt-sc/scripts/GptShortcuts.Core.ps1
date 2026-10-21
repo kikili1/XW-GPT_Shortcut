@@ -3,9 +3,10 @@ Set-StrictMode -Version 2.0
 
 function Get-GptDesiredBindings {
     return [ordered]@{
-        globalDictationHold = 'Alt+Shift+P'
-        focusMainChat = 'Alt+L'
-        hotkeyWindow = 'Alt+Shift+I'
+        'composer.startVoiceMode' = 'Alt+Shift+I'
+        globalDictationHold = 'Alt+Shift+U'
+        realtimeVoice = $null
+        'realtimeVoice.toggleMicrophoneMute' = 'Alt+Shift+P'
     }
 }
 
@@ -53,11 +54,71 @@ function Merge-GptBindings {
     return ,($merged.ToArray())
 }
 
+function ConvertTo-GptKeyIdentity {
+    param([AllowNull()][string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Key)) { return '' }
+    $parts = ($Key -replace '\s','').ToLowerInvariant().Split('+') | ForEach-Object {
+        switch ($_) {
+            { $_ -in @('cmdorctrl','commandorcontrol','control') } { 'ctrl'; break }
+            'option' { 'alt'; break }
+            { $_ -in @('super','meta','windows') } { 'win'; break }
+            default { $_ }
+        }
+    }
+    return (($parts | Sort-Object) -join '+')
+}
+
+function Get-GptEffectiveBindings {
+    param([AllowEmptyCollection()][object[]]$Entries, [object[]]$Catalog = @())
+    $effective = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach ($item in $Catalog) {
+        $keys = @()
+        if ($null -ne $item.PSObject.Properties['DefaultKeys']) { $keys = @($item.DefaultKeys) }
+        $effective[$item.Command] = [pscustomobject]@{ Command=$item.Command; Keys=$keys; TitleIntlId=$item.TitleIntlId }
+    }
+    foreach ($entry in $Entries) {
+        $title = $null
+        if ($effective.ContainsKey($entry['command'])) { $title = $effective[$entry['command']].TitleIntlId }
+        $keys = @()
+        if (-not [string]::IsNullOrWhiteSpace($entry['key'])) { $keys = @($entry['key']) }
+        $effective[$entry['command']] = [pscustomobject]@{ Command=$entry['command']; Keys=$keys; TitleIntlId=$title }
+    }
+    return ,@($effective.Values)
+}
+
+function Resolve-GptBindingConflicts {
+    param([AllowEmptyCollection()][object[]]$Entries, [Collections.IDictionary]$Desired,
+        [AllowNull()][string]$DesktopHotkey, [object[]]$Catalog = @())
+    $reserved = @{}
+    if ($DesktopHotkey) { $reserved[(ConvertTo-GptKeyIdentity $DesktopHotkey)] = '<desktop>' }
+    $resolved = New-Object Collections.Specialized.OrderedDictionary ([StringComparer]::Ordinal)
+    foreach ($pair in $Desired.GetEnumerator()) {
+        $resolved[$pair.Key] = $pair.Value
+        $key = ConvertTo-GptKeyIdentity $pair.Value
+        if (-not $key) { continue }
+        if ($reserved.ContainsKey($key)) { throw "Requested shortcuts conflict: $($pair.Key) / $($reserved[$key]). Choose distinct shortcuts." }
+        $reserved[$key] = $pair.Key
+    }
+    $removed = @()
+    $merged = Merge-GptBindings $Entries $Desired
+    foreach ($item in (Get-GptEffectiveBindings $merged $Catalog)) {
+        if ($Desired.Contains($item.Command)) { continue }
+        $occupied = @($item.Keys | Where-Object { $reserved.ContainsKey((ConvertTo-GptKeyIdentity $_)) })
+        if ($occupied.Count -gt 0) {
+            # An explicit null suppresses defaults; deleting an override would restore them.
+            $resolved[$item.Command] = $null
+            $removed += [pscustomobject]@{ Command=$item.Command; TitleIntlId=$item.TitleIntlId; PreviousKeys=@($item.Keys) }
+        }
+    }
+    return [pscustomobject]@{ Desired=$resolved; RemovedConflicts=$removed }
+}
+
 function Get-GptBindingReport {
     param(
         [AllowEmptyCollection()][object[]]$Entries,
         [Collections.IDictionary]$Desired = (Get-GptDesiredBindings),
-        [AllowNull()][AllowEmptyString()][string]$DesktopHotkey = 'Alt+Shift+O'
+        [AllowNull()][AllowEmptyString()][string]$DesktopHotkey = 'Alt+Shift+O',
+        [object[]]$Catalog = @()
     )
     $checks = @()
     foreach ($pair in $Desired.GetEnumerator()) {
@@ -66,20 +127,21 @@ function Get-GptBindingReport {
         if ($matches.Count -eq 1) { $actual = $matches[0]['key'] }
         $checks += [pscustomobject]@{ Command=$pair.Key; Expected=$pair.Value; Actual=$actual; Matches=($matches.Count -eq 1 -and $actual -ceq $pair.Value) }
     }
-    $conflicts = @($Entries | Where-Object {
-        $DesktopHotkey -and $null -ne $_['key'] -and ($_['key'] -replace '\s','') -ieq ($DesktopHotkey -replace '\s','')
-    } | ForEach-Object { $_['command'] })
+    $effective = Get-GptEffectiveBindings $Entries $Catalog
+    $conflicts = @($effective | Where-Object {
+        $DesktopHotkey -and @($_.Keys | Where-Object { (ConvertTo-GptKeyIdentity $_) -eq (ConvertTo-GptKeyIdentity $DesktopHotkey) }).Count -gt 0
+    } | ForEach-Object { $_.Command })
     $targetConflicts = @()
     foreach ($pair in $Desired.GetEnumerator()) {
-        foreach ($entry in $Entries) {
-            if ($null -ne $pair.Value -and $entry['command'] -cne $pair.Key -and $null -ne $entry['key'] -and
-                ($entry['key'] -replace '\s','') -ieq $pair.Value) {
-                $targetConflicts += "$($pair.Key) / $($entry['command']): $($pair.Value)"
+        foreach ($entry in $effective) {
+            if ($pair.Value -and $entry.Command -cne $pair.Key -and
+                @($entry.Keys | Where-Object { (ConvertTo-GptKeyIdentity $_) -eq (ConvertTo-GptKeyIdentity $pair.Value) }).Count -gt 0) {
+                $targetConflicts += "$($pair.Key) / $($entry.Command): $($pair.Value)"
             }
         }
     }
     return [pscustomobject]@{
-        Matches=(@($checks | Where-Object { -not $_.Matches }).Count -eq 0)
+        Matches=(@($checks | Where-Object { -not $_.Matches }).Count -eq 0 -and $conflicts.Count -eq 0 -and $targetConflicts.Count -eq 0)
         Bindings=$checks; DesktopHotkeyConflicts=$conflicts; OtherConflicts=$targetConflicts
     }
 }
@@ -179,13 +241,13 @@ function Restore-GptFiles {
 }
 
 function Invoke-GptTransaction {
-    param($Context, $Adapter, [string]$RunDirectory, [scriptblock]$Progress = {}, $Plan = $null)
+    param($Context, $Adapter, [string]$RunDirectory, [scriptblock]$Progress = {}, $Plan = $null, [object[]]$Catalog = @())
     if ($null -eq $Plan) {
         $Plan = [pscustomobject]@{ Initialize=$false; InitializationPath=$null; Desired=(Get-GptDesiredBindings); ManageDesktop=$true; DesktopHotkey='Alt+Shift+O'; HasChanges=$true }
     }
     $result = [ordered]@{
         State='Running'; Stage='Preflight'; Error=$null; RestoreError=$null
-        Restored=$false; RestartRequired=$false; Message=$null; Verification=$null; BackupDirectory=$null
+        Restored=$false; RestartRequired=$false; Message=$null; Verification=$null; BackupDirectory=$null; RemovedConflicts=@()
     }
     $snapshot = $null; $mutated = $false
     try {
@@ -198,23 +260,42 @@ function Invoke-GptTransaction {
         $initializationPath = $null
         if ($Plan.Initialize) { $initializationPath = $Plan.InitializationPath }
         $entries = Read-GptBindings $Context.BindingPath
+        $resolution = Resolve-GptBindingConflicts $entries $Plan.Desired $Plan.DesktopHotkey $Catalog
         if ($Plan.ManageDesktop) { & $Adapter.CheckShortcut $Context }
         $snapshot = Backup-GptFiles $Context (Join-Path $RunDirectory 'before-write') $Plan.ManageDesktop $initializationPath
         $result.BackupDirectory = $snapshot.Directory
         $result.Stage = 'Writing'; & $Progress $result
         $mutated = $true
-        if ($Plan.Desired.Count -gt 0) { Write-GptBindings $Context.BindingPath (Merge-GptBindings $entries $Plan.Desired) }
+        if ($resolution.Desired.Count -gt 0) { Write-GptBindings $Context.BindingPath (Merge-GptBindings $entries $resolution.Desired) }
         if ($Plan.ManageDesktop) { & $Adapter.WriteShortcut $Context }
         $result.Stage = 'Verifying'; & $Progress $result
-        $bindingReport = Get-GptBindingReport (Read-GptBindings $Context.BindingPath) $Plan.Desired $Plan.DesktopHotkey
+        $bindingReport = Get-GptBindingReport (Read-GptBindings $Context.BindingPath) $resolution.Desired $Plan.DesktopHotkey $Catalog
         $shortcutReport = [pscustomobject]@{ Matches=$true; Skipped=$true }
         if ($Plan.ManageDesktop) { $shortcutReport = & $Adapter.VerifyShortcut $Context }
         $result.Verification = @{ Keybindings=$bindingReport; Shortcut=$shortcutReport }
         if (-not $bindingReport.Matches -or -not $shortcutReport.Matches) { throw 'Configuration or shortcut read-back failed.' }
+        if ($Plan.ManageDesktop -and $Plan.DesktopHotkey) {
+            if (-not $Adapter.ContainsKey('VerifyActivation')) { throw 'Desktop activation verification is required; no verifier was provided.' }
+            $result.Stage = 'CheckingDesktopActivation'; & $Progress $result
+            $activation = & $Adapter.VerifyActivation $Context
+            $result.Verification['DesktopActivation'] = $activation
+            if (-not $activation.Matches) {
+                # One bounded retry replays clear/save/notify and restore/save/notify.
+                $result.Stage = 'RetryingDesktopActivation'; & $Progress $result
+                & $Adapter.WriteShortcut $Context
+                $shortcutReport = & $Adapter.VerifyShortcut $Context
+                $result.Verification['Shortcut'] = $shortcutReport
+                if (-not $shortcutReport.Matches) { throw 'Desktop shortcut read-back failed after refresh.' }
+                $activation = & $Adapter.VerifyActivation $Context
+                $result.Verification['DesktopActivation'] = $activation
+                if (-not $activation.Matches) { throw ('Desktop hotkey activation was not verified: ' + $activation.Outcome) }
+            }
+        }
         if ($Plan.Initialize) {
             Write-GptAtomicText $initializationPath (@{ Version=1; Status='Initialized'; InitializedAt=[DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json)
         }
         $result.RestartRequired = $true
+        $result.RemovedConflicts = $resolution.RemovedConflicts
         $result.Message = 'Settings saved. Please fully exit and reopen ChatGPT manually for the changes to take effect.'
         $result.State = 'Succeeded'; $result.Stage = 'Complete'
     }
@@ -224,6 +305,7 @@ function Invoke-GptTransaction {
         if ($mutated -and $null -ne $snapshot) {
             try {
                 Restore-GptFiles $Context $snapshot
+                if ($Plan.ManageDesktop -and $Adapter.ContainsKey('NotifyRestoredShortcut')) { & $Adapter.NotifyRestoredShortcut $Context }
                 $result.Restored = $true
             }
             catch { $result.RestoreError = $_.Exception.Message }

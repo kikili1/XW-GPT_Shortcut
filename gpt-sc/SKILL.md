@@ -1,48 +1,43 @@
 ---
 name: gpt-sc
-description: 在 Windows 上用外置 PowerShell 脚本初始化或自定义 ChatGPT 内置快捷键、修改桌面启动热键，完成后提示用户手动重启。首次应用设置 GPT-SC 的四组预设，后续按用户要求修改其他快捷键或禁用绑定，保留未指定的设置。不用于网页或终端 Codex 的按键配置。
+description: 在 Windows 上初始化或自定义 ChatGPT 桌面快捷键，自动解绑冲突、刷新并实测桌面启动热键，完成后简短提示手动重启。不用于网页或终端 Codex。
 ---
 
 # GPT-SC
 
-使用本技能目录中的 `scripts/Set-GptShortcuts.ps1`，不要临时拼装配置写入命令。面向使用 `.codex/keybindings.json` 的 Windows ChatGPT 桌面应用；旧版配置不兼容时停止并报告。
-
-## 首次初始化
-
-技能安装后首次执行 `Apply` 时设置下列预设。脚本在所选配置目录中记录 `gpt-sc.initialized.json`；此记录在配置写入及回读校验成功后创建；事务失败时随配置一起回滚。安装技能文件本身不修改 GPT。
-
-| 功能 | 命令标识 | 快捷键 |
-| --- | --- | --- |
-| 听写快捷键 | `globalDictationHold` | `Alt+Shift+P` |
-| 聚焦主聊天输入框 | `focusMainChat` | `Alt+L` |
-| 弹出窗口快捷键 | `hotkeyWindow` | `Alt+Shift+I` |
-| 桌面 ChatGPT.lnk | Windows 快捷方式 | `Alt+Shift+O` |
-
-此后不再自动重设这四项，包括用户在 GPT 设置中自行修改的值。已初始化后，无参数 `Apply` 返回 `NoChanges`，不退出或重启 GPT。不删除初始化记录来修改其他快捷键，也不重新套用全部预设；若用户要求恢复某项预设，像普通自定义修改一样显式指定它。
+使用 `scripts/Set-GptShortcuts.ps1` 操作采用 `.codex/keybindings.json` 的 Windows ChatGPT 桌面应用。脚本兼容 PowerShell 5.1；版本不兼容时停止。仅在用户要求实际设置时执行 `Apply`，安装或修改技能不应用设置。
 
 ## 调用
 
-用技能实际绝对路径替换下面的 `<skill>`。脚本兼容 Windows PowerShell 5.1，无需 Python、Node 或常驻热键工具。
+将 `<skill>` 替换为技能绝对路径：
 
 ```powershell
-# 只读预览，默认模式；不创建日志、备份或快捷方式
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1"
-
-# 首次应用预设；已初始化后无参数调用不会重设快捷键
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1" -Mode Apply
-
-# 只读列出本机应用注册的命令标识及名称翻译键
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1" -ListCommands
-
-# 只读检查当前设置；携带自定义参数时检查该批修改是否已生效
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1" -Mode Verify
+$runner = '<skill>\scripts\Set-GptShortcuts.ps1'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner                    # Preview，只读预览
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -ListCommands      # 本机命令及名称翻译键
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -Mode Apply        # 应用并实测桌面热键
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -Mode Verify       # 只读检查文件与属性
 ```
 
-## 自定义任意受支持快捷键
+默认识别安装位置和当前用户桌面，配置目录使用 `CODEX_HOME`，否则使用用户的 `.codex`。安装不唯一时报告候选；可用 `-AppPath` 指定 `ChatGPT.exe`、`-ConfigRoot` 指定配置目录，不写死版本或其他用户路径。
 
-用户可用自然语言要求修改 GPT 的其他快捷键，也可修改这四项预设。先用 `-ListCommands` 对照本机当前版本的注册命令，确定用户所指功能；`TitleIntlId` 是应用的翻译键，可结合当前版本的界面或语言资源核实名称。不要凭猜测创建命令标识。注册列表并不保证账号或当前界面具有对应功能权限。
+## 初始化与自定义
 
-将用户要求转换为 UTF-8 JSON 数组，保存在当前工作目录或临时目录，并用 `-BindingsFile` 交给脚本。例如，把新建任务改为 `Alt+N` 并禁用实时语音快捷键：
+首次 `Apply` 应用以下预设，用户同批指定的值优先：
+
+| 功能 | 命令 | 快捷键 |
+| --- | --- | --- |
+| 从输入框启动语音模式 | `composer.startVoiceMode` | `Alt+Shift+I` |
+| 按住进行全局听写 | `globalDictationHold` | `Alt+Shift+U` |
+| 实时语音入口快捷键 | `realtimeVoice` | `null`（显式禁用） |
+| 语音通话麦克风静音／取消静音 | `realtimeVoice.toggleMicrophoneMute` | `Alt+Shift+P` |
+| 桌面启动 | `ChatGPT.lnk` | `Alt+Shift+O` |
+
+聚焦主聊天输入框沿用程序默认 `Alt+L`，不写入预设；不再将 `Alt+Shift+I` 绑定到 `hotkeyWindow`。`realtimeVoice` 的禁用项仅禁用该命令的快捷键，不禁用语音功能或 `composer.startVoiceMode` 入口。
+
+成功后写入 `gpt-sc.initialized.json`。后续只修改指定的应用内绑定，不重设预设或删除初始化记录。每次 `Apply` 都刷新并检查桌面热键：未指定时沿用现有值，快捷方式缺失时重建，热键为空时保留禁用状态。
+
+自定义前用 `-ListCommands` 核实功能与命令标识，必要时通过 `TitleIntlId` 对照界面或语言资源；命令已注册不代表当前账号可用。将请求保存为 UTF-8 JSON 数组：
 
 ```json
 [
@@ -52,39 +47,45 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-Gpt
 ```
 
 ```powershell
-# 预览自定义请求
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1" -BindingsFile "<request.json>"
-
-# 应用指定修改，完成后提示手动重启
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1" -Mode Apply -BindingsFile "<request.json>"
-
-# 校验同一批自定义修改
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1" -Mode Verify -BindingsFile "<request.json>"
-
-# 单独修改桌面启动热键；None 表示取消桌面热键，保留快捷方式
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Set-GptShortcuts.ps1" -Mode Apply -DesktopHotkey "Alt+Shift+K"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -Mode Apply -BindingsFile '<request.json>'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -Mode Verify -BindingsFile '<request.json>'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -Mode Apply -DesktopHotkey 'Alt+Shift+K'
 ```
 
-`key` 使用 GPT 支持的快捷键写法，例如 `Ctrl+Shift+N`；`null` 显式禁用该命令的快捷键，不代表恢复默认。脚本拒绝未知命令、重复命令和自定义空字符串。首次应用也可以携带自定义参数：用户指定值优先于同一项预设，其他首次预设仍应用。后续只修改 JSON 中明确指定的命令；未传 `-DesktopHotkey` 时不修改、校验或恢复桌面快捷方式。
+`key: null` 禁用快捷键，不是恢复默认；未知命令、重复命令和空字符串会被拒绝。`-DesktopHotkey None` 取消桌面热键并保留快捷方式。`Verify` 检查指定修改时须携带相同参数；无参数时仅展示当前设置，不断言等于首次预设。退出码 0 表示文件与属性匹配，1 表示不匹配或错误。
 
-用户要求实际设置或恢复快捷键时使用 `Apply`；仅要求检查、预览或生成技能时不要应用。设置成功后明确提示用户：**请完全退出 GPT（包括托盘中的进程），然后手动重新打开，使快捷键生效。** 不替用户退出、结束进程、启动或重启 GPT，也不创建后台重启任务。仅预览、检查、无修改或执行失败时，不声称设置已生效。
+## 冲突处理
 
-默认自动识别安装和当前用户实际桌面（包括重定向桌面），配置目录使用 `CODEX_HOME`，未设置时使用用户的 `.codex`。若发现多个安装而无法唯一确定，报告候选；可通过 `-AppPath` 指定 `ChatGPT.exe`、`-ConfigRoot` 指定配置目录。不能靠写死包版本或其他用户的路径解决。
+目标快捷键优先。脚本合并本机应用注册命令的 Windows 默认绑定与用户配置，自动将占用目标按键的其他应用内命令设为 `key: null`，包括桌面热键的占用项，无需再确认。不能删除配置项代替禁用，否则默认值可能恢复；多组默认按键会随该命令一起禁用。
 
-## 执行和结果
+保留未知字段、不冲突的绑定及已有禁用项。回读须确认目标值匹配且相关冲突已清除，成功结果通过 `RemovedConflicts` 记录自动解绑项。用户主动禁用的项目不计入冲突。
 
-`Apply` 在当前 PowerShell 中同步完成：读取最新配置、备份、合并指定修改、写入、回读校验并记录初始化状态。它不要求 GPT 先退出，不进行进程等待或自动重启。调用返回最终结果，不再生成后台执行者或异步运行请求。
+同批目标之间冲突（含桌面热键），或现有 `ChatGPT.lnk` 指向其他应用时，停止写入并报告。不修改其他程序或系统热键，也不声称已清除未知的系统级占用。
 
-运行目录默认是 `%LOCALAPPDATA%\GPT-SC\runs\<运行编号>`，内含 `status.json`、`execution.log` 和 `before-write` 备份。返回 `Succeeded`、`RestartRequired: true` 以及手动重启提示时，表示设置已保存并通过文件校验；必须在答复用户时转述手动重启提示。首次预设和后续自定义修改都遵循此规则。
+## 桌面热键验证
 
-仅合并本次计划中的命令，保留未知字段、其他绑定及 `null` 禁用项。写入、回读校验或初始化记录失败时，恢复本次涉及文件的备份并报告错误，不操作 GPT 进程。恢复失败时报告 `RestoreError` 并保留备份。修改完成后避免再在 GPT 的快捷键设置界面同时编辑这些项目；用户手动重启后，可携带同一批自定义参数执行 `Verify` 检查持久化结果。
+脚本在最终 `ChatGPT.lnk` 路径上执行“清空热键并保存 → 通知 Shell → 短暂等待 → 恢复目标热键并保存 → 再通知”。保持现有权限，不用临时带热键的快捷方式替换原文件，不通过提权或重启 Explorer 修复。
 
-默认保留现有应用内 `Alt+Shift+O` 绑定，包括“显示工作区标签页”，并在设置对应桌面热键时列明冲突；只有用户明确要求时才通过自定义请求修改或禁用它。其他冲突也只报告，不自动解绑。涉及桌面修改时，若已有 `ChatGPT.lnk` 指向其他应用则停止覆盖；只修改内置快捷键时保留该桌面入口。系统可能有其他程序占用热键，脚本只报告可从当前配置和桌面快捷方式读出的冲突。
+启用桌面热键时，`scripts/GptDesktopInterop.cs` 必须实测唤起：先让独立验证窗口获得前台焦点，确认修饰键已松开，再模拟目标热键；8 秒内所选 `ChatGPT.exe` 的可见窗口成为前台才通过。文件属性正确、进程存在或 GPT 原本就在前台均不足以通过。
 
-`Verify` 的退出码为 0 表示本次计划的文件和属性匹配，1 表示不匹配或错误。初始化后，无参数 `Verify` 展示当前设置，不再断言它们等于首次预设；验证具体修改需携带相同的自定义参数。正式应用的同步返回和 `status.json` 包含 `Succeeded` 或 `Failed`、`RestartRequired`、恢复结果及错误信息；它们不包含自动重启结果。日志不包含完整用户配置。
+实测失败或无法判断时，最多重新刷新并测试一次，仍未通过则整次事务失败并回滚。锁屏、无交互桌面、焦点或输入受阻时不能跳过检查或自动提权。桌面热键被主动禁用时仅检查禁用属性。
 
-文件回读只证明设置已保存。桌面可见性、全局按键注册、听写、输入焦点和弹出窗口的实际效果，需要在桌面操作中分别确认；不应报告为已经验证。
+测试允许通过目标按键唤起或打开 GPT，不直接启动程序来代替按键验证，不退出、结束进程或自动重启 GPT。已运行状态下通过只证明当前会话能唤起，不证明完全退出后的冷启动，也不代表听写等应用内功能已经生效。`Preview`、`Verify` 不触发热键。
 
-## 隔离验证
+## 事务与结果
 
-运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill>\scripts\Test-GptShortcuts.ps1"`，在随机临时目录中验证首次初始化、后续自定义、不重复预设、禁用绑定、手动重启提示、失败恢复和真实 `.lnk` 属性。测试断言配置流程不会调用退出或启动操作；测试不会操作本机 GPT 或真实桌面。保留的临时目录路径会出现在测试结果中。
+`Apply` 同步完成备份、写入、回读、桌面实测及初始化记录。任一步失败时恢复涉及文件并通知 Shell；恢复失败报告 `RestoreError`，保留备份。运行记录默认存于 `%LOCALAPPDATA%\GPT-SC\runs\<运行编号>`，包含 `status.json`、`execution.log` 和 `before-write` 备份，日志不保存完整用户配置。
+
+仅在 `Succeeded` 且 `RestartRequired: true` 时使用以下回复，不列出已设置的快捷键、按键组合、命令标识、路径或测试过程：
+
+> 初始化完毕。已移除“<冲突功能名称>”的快捷键。请完全退出 GPT（包括托盘进程），再手动重新打开以生效。
+
+按 `RemovedConflicts` 列出全部实际解绑项，依据当前界面或语言资源使用中文功能名称；无冲突时省略第二句。失败或回滚时简短报告原因，不套用成功回复。
+
+## 隔离测试
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File '<skill>\scripts\Test-GptShortcuts.ps1'
+```
+
+测试覆盖初始化、自定义、冲突清理、原路径热键刷新、原生检查器编译、实测门槛、一次重试及回滚。真实 COM 快捷方式位于临时目录，唤起结果由隔离适配器模拟，不操作本机 GPT 或真实桌面，不能作为实际唤起证明。

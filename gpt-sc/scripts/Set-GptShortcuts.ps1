@@ -13,6 +13,53 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'GptShortcuts.Core.ps1')
+$script:GptDesktopInteropPath = Join-Path $PSScriptRoot 'GptDesktopInterop.cs'
+
+function Get-GptJsObject {
+    param([string]$Source, [int]$Start, [char]$Opening = '{', [char]$Closing = '}')
+    $depth = 0; $quote = [char]0
+    for ($i = $Start; $i -lt $Source.Length; $i++) {
+        $c = $Source[$i]
+        if ($quote -ne [char]0) {
+            if ($c -eq '\') { $i++; continue }
+            if ($c -eq $quote) { $quote = [char]0 }
+            continue
+        }
+        if ($c -eq '"' -or $c -eq "'" -or $c -eq '`') { $quote = $c; continue }
+        if ($c -eq $Opening) { $depth++ }
+        if ($c -eq $Closing) {
+            $depth--
+            if ($depth -eq 0) { return $Source.Substring($Start, $i - $Start + 1) }
+        }
+    }
+    throw 'Cannot read command object from this app version.'
+}
+
+function Get-GptCommandDefaults {
+    param([string]$CommandObject)
+    $electron = [regex]::Match($CommandObject, '\belectron\s*:\s*\{')
+    if (-not $electron.Success) { return ,@() }
+    $block = Get-GptJsObject $CommandObject ($electron.Index + $electron.Length - 1)
+    $defaults = [regex]::Match($block, '\bdefaultKeybindings\s*:\s*\[')
+    $keySource = $block
+    $platform = [regex]::Match($block, '\bplatformDefaultKeybindings\s*:\s*\{')
+    if ($platform.Success) {
+        $platformBlock = Get-GptJsObject $block ($platform.Index + $platform.Length - 1)
+        $windows = [regex]::Match($platformBlock, '\bwindows\s*:\s*\[', 'IgnoreCase')
+        if (-not $windows.Success) { $windows = [regex]::Match($platformBlock, '\bdefault\s*:\s*\[') }
+        if ($windows.Success) { $defaults = $windows; $keySource = $platformBlock }
+    }
+    if (-not $defaults.Success) {
+        if ($block -match '\bdefaultKeybindings\s*:') { throw 'Unsupported dynamic default keybindings; refusing incomplete conflict detection.' }
+        return ,@()
+    }
+    $array = Get-GptJsObject $keySource ($defaults.Index + $defaults.Length - 1) '[' ']'
+    $keys = @([regex]::Matches($array, '\bkey\s*:\s*(?<quote>[`"''])(?<key>(?:\\.|(?!\k<quote>).)*)\k<quote>') | ForEach-Object {
+        $_.Groups['key'].Value -replace '\\([\\`"''])','$1'
+    })
+    if ($array -notmatch '^\[\s*\]$' -and $keys.Count -eq 0) { throw 'Cannot read default shortcut keys for this app version.' }
+    return ,$keys
+}
 
 function Assert-GptAppSchema {
     param([string]$Executable, [switch]$Catalog)
@@ -30,7 +77,7 @@ function Assert-GptAppSchema {
         $header = (New-GptJsonSerializer).DeserializeObject([Text.Encoding]::UTF8.GetString($headerBytes))
         $files = $header['files']['.vite']['files']['build']['files']
         $supported = $false
-        $commands = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+        $commands = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
         foreach ($name in $files.Keys) {
             if ($name -notmatch '^(main|src)-.*\.js$') { continue }
             $entry = $files[$name]
@@ -43,7 +90,16 @@ function Assert-GptAppSchema {
             }
             if ($Catalog) {
                 foreach ($match in [regex]::Matches($source, '\bid:\s*[`"'']([^`"'']+)[`"'']\s*,\s*titleIntlId:\s*[`"'']([^`"'']+)[`"'']')) {
-                    if ($match.Groups[2].Value.StartsWith('codex.command.')) { $commands[$match.Groups[1].Value] = $match.Groups[2].Value }
+                    if ($match.Groups[2].Value.StartsWith('codex.command.')) {
+                        $objectStart = $source.LastIndexOf('{', $match.Index)
+                        $commandObject = Get-GptJsObject $source $objectStart
+                        try { $defaultKeys = Get-GptCommandDefaults $commandObject }
+                        catch { throw ($match.Groups[1].Value + ': ' + $_.Exception.Message) }
+                        $commands[$match.Groups[1].Value] = [pscustomobject]@{
+                            Command=$match.Groups[1].Value; TitleIntlId=$match.Groups[2].Value
+                            DefaultKeys=$defaultKeys
+                        }
+                    }
                 }
             }
             elseif ($supported) { break }
@@ -51,7 +107,7 @@ function Assert-GptAppSchema {
         if (-not $supported) { throw 'This app version does not expose the supported keybindings.json commands.' }
         if ($Catalog) {
             if ($commands.Count -eq 0) { throw 'Cannot read the command catalog for this app version.' }
-            return ,@($commands.GetEnumerator() | Sort-Object Key | ForEach-Object { [pscustomobject]@{ Command=$_.Key; TitleIntlId=$_.Value } })
+            return ,@($commands.Values | Sort-Object Command)
         }
     }
     finally { $reader.Dispose(); $stream.Dispose() }
@@ -168,24 +224,69 @@ function Assert-GptShortcutOwner {
 }
 
 function Set-GptShortcut {
-    param($Context)
+    param($Context, [scriptblock]$Notify = { param($path, $created) Send-GptShortcutNotification $path $created })
     $wsh = New-Object -ComObject WScript.Shell
-    $temporary = Join-Path $Context.Desktop ('ChatGPT.' + [guid]::NewGuid().ToString('N') + '.lnk')
-    try {
-        $link = $wsh.CreateShortcut($temporary)
+    $created = -not [IO.File]::Exists($Context.ShortcutPath)
+    $requestedHotkey = 'Alt+Shift+O'
+    if ($null -ne $Context.PSObject.Properties['DesktopHotkey']) { $requestedHotkey = [string]$Context.DesktopHotkey }
+    $link = $wsh.CreateShortcut($Context.ShortcutPath)
+    # Save at the final path so Explorer sees the hotkey being removed and re-added.
+    # Replacing a temporary .lnk only proves file contents, not Shell registration.
+    if ($created) {
         $link.TargetPath = $Context.ShortcutTarget
         $link.Arguments = $Context.ShortcutArguments
         $link.WorkingDirectory = Split-Path -Parent $Context.AppPath
         $link.IconLocation = $Context.IconLocation
         $link.Description = 'ChatGPT'
-        $requestedHotkey = 'Alt+Shift+O'
-        if ($null -ne $Context.PSObject.Properties['DesktopHotkey']) { $requestedHotkey = $Context.DesktopHotkey }
+    }
+    $link.Hotkey = ''
+    $link.Save()
+    & $Notify $Context.ShortcutPath $created
+    if ($requestedHotkey) {
+        Start-Sleep -Milliseconds 350
+        $link = $wsh.CreateShortcut($Context.ShortcutPath)
         $link.Hotkey = $requestedHotkey
         $link.Save()
-        if ([IO.File]::Exists($Context.ShortcutPath)) { [IO.File]::Replace($temporary, $Context.ShortcutPath, [NullString]::Value) }
-        else { [IO.File]::Move($temporary, $Context.ShortcutPath) }
+        & $Notify $Context.ShortcutPath $false
     }
-    finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+
+function Initialize-GptDesktopInterop {
+    if (-not ('GptDesktopInterop' -as [type])) {
+        Add-Type -Path $script:GptDesktopInteropPath -ReferencedAssemblies System,System.Windows.Forms,System.Drawing
+    }
+}
+
+function Send-GptShortcutNotification {
+    param([string]$Path, [bool]$Created = $false)
+    Initialize-GptDesktopInterop
+    [GptDesktopInterop]::Notify($Path, $Created)
+}
+
+function Test-GptDesktopActivation {
+    param($Context)
+    Initialize-GptDesktopInterop
+    $outcome = [GptDesktopInterop]::CheckActivation($Context.AppPath, $Context.DesktopHotkey, 8000)
+    return [pscustomobject]@{ Matches=($outcome -ceq 'Verified'); Outcome=$outcome; Method='HotkeyToForegroundWindow' }
+}
+
+function Complete-GptDesktopPlan {
+    param($Plan, $Context)
+    # Every Apply refreshes and verifies the desktop hotkey, without resetting app presets.
+    Assert-GptShortcutOwner $Context
+    if (-not $Plan.ManageDesktop) {
+        $link = Get-GptShortcut $Context
+        $Plan.DesktopHotkey = 'Alt+Shift+O'
+        if ($null -ne $link) { $Plan.DesktopHotkey = [string]$link.Hotkey }
+        $Plan.ManageDesktop = $true
+        $Plan.HasChanges = $true
+    }
+    $Context | Add-Member -NotePropertyName DesktopHotkey -NotePropertyValue $Plan.DesktopHotkey -Force
+    if ($Plan.DesktopHotkey) {
+        Initialize-GptDesktopInterop
+        [void][GptDesktopInterop]::ParseHotkey($Plan.DesktopHotkey)
+    }
+    return $Plan
 }
 
 function Test-GptShortcut {
@@ -229,17 +330,20 @@ try {
     $desktopSpecified = $PSBoundParameters.ContainsKey('DesktopHotkey')
     if ($DesktopHotkey -ieq 'None') { $DesktopHotkey = '' }
     $plan = Get-GptChangePlan $context.InitializationPath $requestedBindings $desktopSpecified $DesktopHotkey
+    if ($Mode -eq 'Apply') { $plan = Complete-GptDesktopPlan $plan $context }
     $context | Add-Member -NotePropertyName DesktopHotkey -NotePropertyValue $plan.DesktopHotkey -Force
     $entries = Read-GptBindings $context.BindingPath
+    $resolution = Resolve-GptBindingConflicts $entries $plan.Desired $plan.DesktopHotkey $script:GptCommandCatalog
     $shortcutReport = [pscustomobject]@{ Matches=$true; Skipped=$true; Actual=(Get-GptShortcut $context) }
     if ($plan.ManageDesktop) { Assert-GptShortcutOwner $context; $shortcutReport = Test-GptShortcut $context }
     $report = [ordered]@{
         Mode=$Mode; Context=$context
         FirstRun=$plan.Initialize; HasChanges=$plan.HasChanges; CurrentEntries=$entries
-        CurrentBindings=(Get-GptBindingReport $entries $plan.Desired $plan.DesktopHotkey)
-        PlannedBindings=(Get-GptBindingReport (Merge-GptBindings $entries $plan.Desired) $plan.Desired $plan.DesktopHotkey)
+        CurrentBindings=(Get-GptBindingReport $entries $plan.Desired $plan.DesktopHotkey $script:GptCommandCatalog)
+        PlannedBindings=(Get-GptBindingReport (Merge-GptBindings $entries $resolution.Desired) $resolution.Desired $plan.DesktopHotkey $script:GptCommandCatalog)
+        RemovedConflicts=$resolution.RemovedConflicts
         Shortcut=$shortcutReport
-        Note='Existing bindings are preserved. Read-back is not proof of actual hotkey behavior.'
+        Note='Conflicting app bindings are explicitly disabled. Read-back is not proof of actual hotkey behavior.'
     }
     if ($Mode -ne 'Apply') {
         $report | ConvertTo-Json -Depth 20
@@ -262,16 +366,20 @@ try {
         try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
         if (-not $locked) { throw 'Another GPT-SC Apply operation is active for this user.' }
         $plan = Get-GptChangePlan $context.InitializationPath $requestedBindings $desktopSpecified $DesktopHotkey
+        $plan = Complete-GptDesktopPlan $plan $context
         $context | Add-Member -NotePropertyName DesktopHotkey -NotePropertyValue $plan.DesktopHotkey -Force
         $adapter = @{
             CheckShortcut = { param($ctx) Assert-GptShortcutOwner $ctx }
             WriteShortcut = { param($ctx) Set-GptShortcut $ctx }
             VerifyShortcut = { param($ctx) Test-GptShortcut $ctx }
+            VerifyActivation = { param($ctx) Test-GptDesktopActivation $ctx }
+            NotifyRestoredShortcut = { param($ctx) Initialize-GptDesktopInterop; [GptDesktopInterop]::NotifyRestored($ctx.ShortcutPath) }
         }
         $progress = { param($state) Write-GptRunStatus $RunDirectory $state $context }
-        $result = Invoke-GptTransaction $context $adapter $RunDirectory $progress -Plan $plan
+        $result = Invoke-GptTransaction $context $adapter $RunDirectory $progress -Plan $plan -Catalog $script:GptCommandCatalog
         [pscustomobject]@{
             State=$result.State; RestartRequired=$result.RestartRequired; Message=$result.Message
+            RemovedConflicts=$result.RemovedConflicts
             RunDirectory=$RunDirectory; StatusPath=(Join-Path $RunDirectory 'status.json'); Result=$result
         } | ConvertTo-Json -Depth 20
         if ($result.State -ne 'Succeeded') { exit 1 }
